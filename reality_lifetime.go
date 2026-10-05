@@ -34,8 +34,11 @@ func newRealityConnLifetime(ctx, fallbackCtx context.Context, client, target net
 		fallbackCtx = ctx
 	}
 	l := &realityConnLifetime{
-		ctx: ctx, client: client, target: target,
-		done: make(chan struct{}), joined: make(chan struct{}),
+		ctx:    ctx,
+		client: client,
+		target: target,
+		done:   make(chan struct{}),
+		joined: make(chan struct{}),
 	}
 	go func() {
 		defer close(l.joined)

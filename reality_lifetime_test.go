@@ -25,7 +25,10 @@ func realityTestTCPPair(t *testing.T) (*net.TCPConn, *net.TCPConn) {
 		a.Close()
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { a.Close(); b.Close() })
+	t.Cleanup(func() {
+		a.Close()
+		b.Close()
+	})
 	a.SetDeadline(time.Now().Add(5 * time.Second))
 	b.SetDeadline(time.Now().Add(5 * time.Second))
 	return a.(*net.TCPConn), b.(*net.TCPConn)
@@ -47,7 +50,9 @@ func TestRealityStreamingFallback(t *testing.T) {
 			done := make(chan error, 1)
 			go func() {
 				_, err := RealityServer(handshakeCtx, server, &RealityConfig{
-					DialContext:     func(context.Context, string, string) (net.Conn, error) { return target, nil },
+					DialContext: func(context.Context, string, string) (net.Conn, error) {
+						return target, nil
+					},
 					FallbackContext: lifecycle,
 				})
 				done <- err
@@ -95,7 +100,9 @@ func TestRealityPartialHelloHalfClose(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		_, err := RealityServer(ctx, server, &RealityConfig{
-			DialContext: func(context.Context, string, string) (net.Conn, error) { return target, nil },
+			DialContext: func(context.Context, string, string) (net.Conn, error) {
+				return target, nil
+			},
 		})
 		done <- err
 	}()
@@ -145,7 +152,9 @@ func TestRealityPartialHelloReset(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		_, err := RealityServer(ctx, server, &RealityConfig{
-			DialContext: func(context.Context, string, string) (net.Conn, error) { return target, nil },
+			DialContext: func(context.Context, string, string) (net.Conn, error) {
+				return target, nil
+			},
 		})
 		done <- err
 	}()

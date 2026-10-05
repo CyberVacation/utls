@@ -79,11 +79,14 @@ func TestRealityAuthenticationHook(t *testing.T) {
 			var called atomic.Int32
 			hookCalled := make(chan struct{}, 1)
 			config := (&RealityConfig{
-				DialContext:     func(context.Context, string, string) (net.Conn, error) { return target, nil },
+				DialContext: func(context.Context, string, string) (net.Conn, error) {
+					return target, nil
+				},
 				FallbackContext: ctx,
 				ServerNames:     map[string]bool{"example.com": true},
-				PrivateKey:      private.Bytes(), ShortIds: map[[8]byte]bool{{}: true},
-				MaxTimeDiff: time.Minute,
+				PrivateKey:      private.Bytes(),
+				ShortIds:        map[[8]byte]bool{{}: true},
+				MaxTimeDiff:     time.Minute,
 				AcceptClientHello: func(hello []byte, clientTime time.Time) bool {
 					called.Add(1)
 					if !bytes.Equal(hello, wire[5:]) {
@@ -97,7 +100,10 @@ func TestRealityAuthenticationHook(t *testing.T) {
 				},
 			}).Clone()
 			done := make(chan error, 1)
-			go func() { _, err := RealityServer(ctx, server, config); done <- err }()
+			go func() {
+				_, err := RealityServer(ctx, server, config)
+				done <- err
+			}()
 			if _, err := client.Write(wire); err != nil {
 				t.Fatal(err)
 			}
@@ -157,12 +163,18 @@ func TestRealityFallbackDoesNotAuthenticateLater(t *testing.T) {
 			done := make(chan error, 1)
 			go func() {
 				_, err := RealityServer(handshakeCtx, server, &RealityConfig{
-					DialContext:     func(context.Context, string, string) (net.Conn, error) { return target, nil },
+					DialContext: func(context.Context, string, string) (net.Conn, error) {
+						return target, nil
+					},
 					FallbackContext: lifecycle,
 					ServerNames:     map[string]bool{"example.com": true},
-					PrivateKey:      private.Bytes(), ShortIds: map[[8]byte]bool{{}: true},
-					MaxTimeDiff:       time.Minute,
-					AcceptClientHello: func([]byte, time.Time) bool { calls.Add(1); return true },
+					PrivateKey:      private.Bytes(),
+					ShortIds:        map[[8]byte]bool{{}: true},
+					MaxTimeDiff:     time.Minute,
+					AcceptClientHello: func([]byte, time.Time) bool {
+						calls.Add(1)
+						return true
+					},
 				})
 				done <- err
 			}()
@@ -219,12 +231,18 @@ func TestRealityDeadlineFlushesPartialTargetFlight(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		_, err := RealityServer(handshakeCtx, server, &RealityConfig{
-			DialContext:     func(context.Context, string, string) (net.Conn, error) { return target, nil },
+			DialContext: func(context.Context, string, string) (net.Conn, error) {
+				return target, nil
+			},
 			FallbackContext: lifecycle,
 			ServerNames:     map[string]bool{"example.com": true},
-			PrivateKey:      private.Bytes(), ShortIds: map[[8]byte]bool{{}: true},
-			MaxTimeDiff:       time.Minute,
-			AcceptClientHello: func([]byte, time.Time) bool { close(authenticated); return true },
+			PrivateKey:      private.Bytes(),
+			ShortIds:        map[[8]byte]bool{{}: true},
+			MaxTimeDiff:     time.Minute,
+			AcceptClientHello: func([]byte, time.Time) bool {
+				close(authenticated)
+				return true
+			},
 		})
 		done <- err
 	}()
