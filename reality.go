@@ -41,10 +41,14 @@ func (c *realityMirrorConn) Read(b []byte) (int, error) {
 	n, err := c.Conn.Read(b)
 	c.Lock() // calling c.Lock() before c.Target.Write(), to make sure that this goroutine has the priority to make the next move
 	if n != 0 {
-		c.Target.Write(b[:n])
+		if _, writeErr := c.Target.Write(b[:n]); writeErr != nil {
+			c.Conn.Close()
+			c.Target.Close()
+			return n, writeErr
+		}
 	}
 	if err != nil {
-		c.Target.Close()
+		realityFinishCopy(c.Target, c.Conn, err)
 	}
 	return n, err
 }
@@ -97,6 +101,17 @@ type RealityLimitFallback struct {
 type RealityConfig struct {
 	DialContext func(ctx context.Context, network, address string) (net.Conn, error)
 
+	// AcceptClientHello runs after parsing and REALITY authentication, before
+	// any locally generated server handshake. Returning false relays the
+	// connection to the target. The callback must not retain or modify hello.
+	AcceptClientHello func(hello []byte, clientTime time.Time) bool
+
+	// FallbackContext owns relayed connections. When non-nil, expiration of
+	// the handshake deadline before committing to REALITY selects fallback
+	// instead of closing the connection. Cancellation of this context still
+	// closes both sockets. If nil, the Server context owns fallback as well.
+	FallbackContext context.Context
+
 	Log  func(format string, v ...any)
 	Type string
 	Dest string
@@ -118,6 +133,8 @@ type RealityConfig struct {
 func (a *RealityConfig) Clone() *RealityConfig {
 	return &RealityConfig{
 		DialContext:           a.DialContext,
+		AcceptClientHello:     a.AcceptClientHello,
+		FallbackContext:       a.FallbackContext,
 		Log:                   a.Log,
 		Type:                  a.Type,
 		Dest:                  a.Dest,
@@ -355,6 +372,8 @@ func RealityServer(ctx context.Context, conn net.Conn, config *RealityConfig) (*
 	}
 
 	underlying := conn
+	lifetime := newRealityConnLifetime(ctx, config.FallbackContext, conn, target)
+	defer lifetime.stop()
 
 	mutex := new(sync.Mutex)
 
@@ -382,7 +401,7 @@ func RealityServer(ctx context.Context, conn net.Conn, config *RealityConfig) (*
 		for {
 			mutex.Lock()
 			hs.clientHello, _, err = hs.c.readClientHello(context.Background()) // TODO: Change some rules in this function.
-			if copying || err != nil || hs.c.vers != VersionTLS13 || !config.ServerNames[hs.clientHello.serverName] {
+			if copying || lifetime.isFallback() || err != nil || hs.c.vers != VersionTLS13 || !config.ServerNames[hs.clientHello.serverName] {
 				break
 			}
 			var peerPub []byte
@@ -431,7 +450,8 @@ func RealityServer(ctx context.Context, conn net.Conn, config *RealityConfig) (*
 				if (config.MinClientVer == nil || realityValue(hs.ClientVer[:]...) >= realityValue(config.MinClientVer...)) &&
 					(config.MaxClientVer == nil || realityValue(hs.ClientVer[:]...) <= realityValue(config.MaxClientVer...)) &&
 					(config.MaxTimeDiff == 0 || config.time().Sub(hs.ClientTime).Abs() <= config.MaxTimeDiff) &&
-					(config.ShortIds[hs.ClientShortId]) {
+					(config.ShortIds[hs.ClientShortId]) &&
+					(config.AcceptClientHello == nil || config.AcceptClientHello(hs.clientHello.original, hs.ClientTime)) {
 					hs.c.conn = conn
 				}
 				break
@@ -441,35 +461,41 @@ func RealityServer(ctx context.Context, conn net.Conn, config *RealityConfig) (*
 			}
 			break
 		}
+		if hs.c.conn != conn {
+			lifetime.fallback()
+			copying = true
+		}
 		mutex.Unlock()
 		if hs.c.conn != conn {
 			if config.Log != nil && hs.clientHello != nil {
 				config.Log("REALITY remoteAddr: %v forwarded SNI: %v", remoteAddr, hs.clientHello.serverName)
 			}
-			io.Copy(target, newRateLimitedConn(underlying, &config.LimitFallbackUpload))
+			_, copyErr := io.Copy(target, newRateLimitedConn(underlying, &config.LimitFallbackUpload))
+			realityFinishCopy(target, underlying, copyErr)
 		}
 		waitGroup.Done()
 	}()
 
 	go func() {
 		s2cSaved := make([]byte, 0, realitySize)
+		var targetFlight []byte
+		var targetReadErr error
+		localHandshake := false
 		buf := make([]byte, realitySize)
 		handshakeLen := 0
 	f:
 		for {
 			runtime.Gosched()
 			n, err := target.Read(buf)
-			if n == 0 {
-				if err != nil {
-					conn.Close()
-					waitGroup.Done()
-					return
-				}
+			err = lifetime.targetReadError(err)
+			if n == 0 && err == nil && !lifetime.isFallback() {
 				continue
 			}
 			mutex.Lock()
+			targetReadErr = err
+			targetFlight = append(targetFlight, buf[:n]...)
 			s2cSaved = append(s2cSaved, buf[:n]...)
-			if hs.c.conn != conn {
+			if err != nil || hs.c.conn != conn || lifetime.isFallback() {
 				copying = true // if the target already sent some data, just start bidirectional direct forwarding
 				break
 			}
@@ -528,6 +554,10 @@ func RealityServer(ctx context.Context, conn net.Conn, config *RealityConfig) (*
 				s2cSaved = s2cSaved[handshakeLen:]
 				handshakeLen = 0
 			}
+			if !lifetime.commit() {
+				break
+			}
+			localHandshake = true
 			start := time.Now()
 			err = hs.handshake()
 			if config.Log != nil {
@@ -559,17 +589,29 @@ func RealityServer(ctx context.Context, conn net.Conn, config *RealityConfig) (*
 			hs.c.isHandshakeComplete.Store(true)
 			break
 		}
+		if !localHandshake {
+			lifetime.fallback()
+			targetReadErr = lifetime.targetReadError(targetReadErr)
+			copying = true
+		}
 		mutex.Unlock()
-		if hs.c.out.handshakeLen[0] == 0 { // if the target sent an incorrect Server Hello, or before that
+		if !localHandshake {
 			if hs.c.conn == conn { // if we processed the Client Hello successfully but the target did not
 				waitGroup.Add(1)
 				go func() {
-					io.Copy(target, newRateLimitedConn(underlying, &config.LimitFallbackUpload))
+					_, copyErr := io.Copy(target, newRateLimitedConn(underlying, &config.LimitFallbackUpload))
+					realityFinishCopy(target, underlying, copyErr)
 					waitGroup.Done()
 				}()
 			}
-			conn.Write(s2cSaved)
-			io.Copy(underlying, newRateLimitedConn(target, &config.LimitFallbackDownload))
+			_, copyErr := conn.Write(targetFlight)
+			if copyErr == nil {
+				copyErr = targetReadErr
+				if copyErr == nil {
+					_, copyErr = io.Copy(underlying, newRateLimitedConn(target, &config.LimitFallbackDownload))
+				}
+			}
+			realityFinishCopy(underlying, target, copyErr)
 		}
 		waitGroup.Done()
 	}()
