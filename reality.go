@@ -18,6 +18,7 @@ import (
 	"net"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/metacubex/utls/internal/mlkem"
@@ -110,6 +111,12 @@ type RealityConfig struct {
 	// Mldsa65Key optionally signs the REALITY certificate and hello transcript.
 	Mldsa65Key []byte
 
+	// GetPostHandshakeRecordLengths returns target TLS record lengths, including
+	// headers, to reproduce after the authenticated client's Finished message.
+	// It must honor ctx and return nil when detection is unavailable. The result
+	// must remain immutable while RealityServer uses it.
+	GetPostHandshakeRecordLengths func(ctx context.Context, serverName string, protocols []string) []int
+
 	LimitFallbackUpload   RealityLimitFallback
 	LimitFallbackDownload RealityLimitFallback
 
@@ -118,21 +125,22 @@ type RealityConfig struct {
 
 func (a *RealityConfig) Clone() *RealityConfig {
 	return &RealityConfig{
-		DialContext:           a.DialContext,
-		Log:                   a.Log,
-		Type:                  a.Type,
-		Dest:                  a.Dest,
-		Xver:                  a.Xver,
-		ServerNames:           a.ServerNames,
-		PrivateKey:            a.PrivateKey,
-		MinClientVer:          a.MinClientVer,
-		MaxClientVer:          a.MaxClientVer,
-		MaxTimeDiff:           a.MaxTimeDiff,
-		ShortIds:              a.ShortIds,
-		Mldsa65Key:            a.Mldsa65Key,
-		LimitFallbackUpload:   a.LimitFallbackUpload,
-		LimitFallbackDownload: a.LimitFallbackDownload,
-		Config:                *a.Config.Clone(),
+		DialContext:                   a.DialContext,
+		Log:                           a.Log,
+		Type:                          a.Type,
+		Dest:                          a.Dest,
+		Xver:                          a.Xver,
+		ServerNames:                   a.ServerNames,
+		PrivateKey:                    a.PrivateKey,
+		MinClientVer:                  a.MinClientVer,
+		MaxClientVer:                  a.MaxClientVer,
+		MaxTimeDiff:                   a.MaxTimeDiff,
+		ShortIds:                      a.ShortIds,
+		Mldsa65Key:                    a.Mldsa65Key,
+		GetPostHandshakeRecordLengths: a.GetPostHandshakeRecordLengths,
+		LimitFallbackUpload:           a.LimitFallbackUpload,
+		LimitFallbackDownload:         a.LimitFallbackDownload,
+		Config:                        *a.Config.Clone(),
 	}
 }
 
@@ -532,11 +540,12 @@ func RealityServer(ctx context.Context, conn net.Conn, config *RealityConfig) (*
 			if err != nil {
 				break
 			}
+			var clientFinished atomic.Bool
 			go func() { // TODO: Probe target's maxUselessRecords and some time-outs in advance.
 				if handshakeLen-len(s2cSaved) > 0 {
 					io.ReadFull(target, buf[:handshakeLen-len(s2cSaved)])
 				}
-				if n, err := target.Read(buf); !hs.c.isHandshakeComplete.Load() {
+				if n, err := target.Read(buf); !clientFinished.Load() {
 					if err != nil {
 						conn.Close()
 					}
@@ -551,6 +560,19 @@ func RealityServer(ctx context.Context, conn net.Conn, config *RealityConfig) (*
 			}
 			if err != nil {
 				break
+			}
+			// The target's unauthenticated handshake can time out while a valid
+			// client waits for a probe. Its lifetime no longer governs this client
+			// once Finished has been verified.
+			clientFinished.Store(true)
+			if config.GetPostHandshakeRecordLengths != nil {
+				lengths := config.GetPostHandshakeRecordLengths(ctx, hs.clientHello.serverName, hs.clientHello.alpnProtocols)
+				if err = ctx.Err(); err != nil {
+					break
+				}
+				if err = hs.c.writeRealityPostHandshakeRecords(lengths); err != nil {
+					break
+				}
 			}
 			hs.c.isHandshakeComplete.Store(true)
 			break
