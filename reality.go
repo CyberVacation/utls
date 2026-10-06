@@ -7,10 +7,8 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/ed25519"
-	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
-	"crypto/sha512"
 	"crypto/x509"
 	"encoding/binary"
 	"errors"
@@ -109,6 +107,9 @@ type RealityConfig struct {
 	MaxTimeDiff  time.Duration
 	ShortIds     map[[8]byte]bool
 
+	// Mldsa65Key optionally signs the REALITY certificate and hello transcript.
+	Mldsa65Key []byte
+
 	LimitFallbackUpload   RealityLimitFallback
 	LimitFallbackDownload RealityLimitFallback
 
@@ -128,6 +129,7 @@ func (a *RealityConfig) Clone() *RealityConfig {
 		MaxClientVer:          a.MaxClientVer,
 		MaxTimeDiff:           a.MaxTimeDiff,
 		ShortIds:              a.ShortIds,
+		Mldsa65Key:            a.Mldsa65Key,
 		LimitFallbackUpload:   a.LimitFallbackUpload,
 		LimitFallbackDownload: a.LimitFallbackDownload,
 		Config:                *a.Config.Clone(),
@@ -241,7 +243,7 @@ func (hs *realityServerHandshakeStateTLS13) handshake() error {
 			}
 		}
 
-		var peerPub = peerData
+		peerPub := peerData
 		if hs.hello.serverShare.group == X25519MLKEM768 {
 			peerPub = peerData[mlkem.EncapsulationKeySize768:]
 		}
@@ -269,16 +271,10 @@ func (hs *realityServerHandshakeStateTLS13) handshake() error {
 		}
 	*/
 	{
-		ed25519Priv, signedCert := realityServerCert()
-		signedCert = append([]byte{}, signedCert...)
-
-		h := hmac.New(sha512.New, hs.AuthKey)
-		h.Write(ed25519Priv[32:])
-		h.Sum(signedCert[:len(signedCert)-64])
-
-		hs.cert = &Certificate{
-			Certificate: [][]byte{signedCert},
-			PrivateKey:  ed25519Priv,
+		var err error
+		hs.cert, err = realityCertificate(hs.AuthKey, hs.clientHello.original, hs.hello.original, config.Mldsa65Key)
+		if err != nil {
+			return err
 		}
 		hs.sigAlg = Ed25519
 	}
@@ -431,7 +427,7 @@ func RealityServer(ctx context.Context, conn net.Conn, config *RealityConfig) (*
 				if (config.MinClientVer == nil || realityValue(hs.ClientVer[:]...) >= realityValue(config.MinClientVer...)) &&
 					(config.MaxClientVer == nil || realityValue(hs.ClientVer[:]...) <= realityValue(config.MaxClientVer...)) &&
 					(config.MaxTimeDiff == 0 || config.time().Sub(hs.ClientTime).Abs() <= config.MaxTimeDiff) &&
-					(config.ShortIds[hs.ClientShortId]) {
+					config.ShortIds[hs.ClientShortId] {
 					hs.c.conn = conn
 				}
 				break
@@ -640,7 +636,6 @@ func NewRealityListener(inner net.Listener, config *RealityConfig) net.Listener 
 				go func() {
 					defer func() {
 						if r := recover(); r != nil {
-
 						}
 					}()
 					c, err = RealityServer(context.Background(), c, l.config)
